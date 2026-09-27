@@ -43,9 +43,6 @@ def triton_apply_rope(
     if positions.dtype not in (torch.int32, torch.int64):
         raise TypeError("positions must contain integers")
 
-    if torch.any(positions < 0):
-        raise ValueError("positions must be nonnegative")
-
     if head_dim < 2 or head_dim % 2 != 0:
         raise ValueError("head_dim must be a positive even integer")
 
