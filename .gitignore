@@ -21,3 +21,6 @@ build/
 
 # Visual Studio Code
 .vscode/
+
+# Local profiling output
+profiles/
