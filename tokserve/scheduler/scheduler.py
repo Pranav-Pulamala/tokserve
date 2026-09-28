@@ -1,8 +1,18 @@
 """Deterministic FIFO request scheduler."""
 
 from collections import deque
+from dataclasses import dataclass
 
 from tokserve.scheduler.request import RequestState, ScheduledRequest
+
+
+@dataclass(frozen=True)
+class ScheduleResult:
+    """Summary of one scheduler admission decision."""
+
+    admitted_requests: tuple[ScheduledRequest, ...]
+    waiting_count: int
+    running_count: int
 
 
 class RequestScheduler:
@@ -52,6 +62,24 @@ class RequestScheduler:
 
         self._requests[request.request_id] = request
         self._waiting.append(request)
+
+    def schedule(self) -> ScheduleResult:
+        """Admit waiting requests in FIFO order up to running capacity."""
+
+        available_slots = self.max_running_requests - self.running_count
+        admitted: list[ScheduledRequest] = []
+
+        for _ in range(min(available_slots, self.waiting_count)):
+            request = self._waiting.popleft()
+            request.mark_running()
+            self._running[request.request_id] = request
+            admitted.append(request)
+
+        return ScheduleResult(
+            admitted_requests=tuple(admitted),
+            waiting_count=self.waiting_count,
+            running_count=self.running_count,
+        )
 
     def get_request(self, request_id: str) -> ScheduledRequest:
         """Return a registered request."""
