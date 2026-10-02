@@ -159,13 +159,13 @@ class RequestScheduler:
         return (total_length + block_size - 1) // block_size
 
     def _available_block_capacity(self) -> int:
-        """Return unreserved allocator capacity."""
+        """Return capacity not claimed by scheduler reservations."""
 
         if self.cache_manager is None:
             return 0
 
         reserved = sum(self._reserved_blocks.values())
-        return max(0, self.cache_manager.allocator.free_count - reserved)
+        return max(0, self.cache_manager.allocator.num_blocks - reserved)
 
     def _release_resources(self, request_id: str) -> None:
         """Release scheduler reservations and active paged-cache ownership."""
