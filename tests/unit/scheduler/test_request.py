@@ -25,6 +25,7 @@ def test_request_transitions_from_waiting_to_running_to_finished() -> None:
     request = create_request()
 
     request.mark_running()
+    request.mark_prefill_complete()
     request.append_generated_token(torch.tensor([[4]], dtype=torch.int64))
     request.mark_finished()
 

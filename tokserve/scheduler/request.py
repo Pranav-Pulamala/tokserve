@@ -4,7 +4,11 @@ from enum import StrEnum
 
 import torch
 
-from tokserve.generation.types import GenerationConfig, GenerationResult
+from tokserve.generation.types import (
+    GenerationConfig,
+    GenerationResult,
+    StopReason,
+)
 
 
 class RequestState(StrEnum):
@@ -49,6 +53,14 @@ class ScheduledRequest:
         self._generated_token_ids = input_ids.new_empty((1, 0))
         self._state = RequestState.WAITING
         self._result: GenerationResult | None = None
+        self._prefill_complete = False
+        self._next_input_token: torch.Tensor | None = None
+        self._completion_reason: StopReason | None = None
+        self._generator: torch.Generator | None = None
+
+        if generation_config.do_sample and generation_config.seed is not None:
+            self._generator = torch.Generator(device=input_ids.device)
+            self._generator.manual_seed(generation_config.seed)
 
     @property
     def input_ids(self) -> torch.Tensor:
@@ -74,6 +86,86 @@ class ScheduledRequest:
 
         return self._result
 
+    @property
+    def prefill_complete(self) -> bool:
+        """Return whether the prompt has populated its paged cache."""
+
+        return self._prefill_complete
+
+    @property
+    def decode_ready(self) -> bool:
+        """Return whether the request can perform one decode step."""
+
+        return (
+            self._state is RequestState.RUNNING
+            and self._prefill_complete
+            and self._next_input_token is not None
+            and self._completion_reason is None
+        )
+
+    @property
+    def next_input_token(self) -> torch.Tensor:
+        """Return the token that should be appended during the next decode."""
+
+        if not self.decode_ready or self._next_input_token is None:
+            raise RuntimeError("request is not decode-ready")
+
+        return self._next_input_token.clone()
+
+    @property
+    def sequence_length(self) -> int:
+        """Return prompt length plus generated output length."""
+
+        return self._input_ids.shape[1] + self._generated_token_ids.shape[1]
+
+    @property
+    def num_generated_tokens(self) -> int:
+        """Return the number of generated tokens."""
+
+        return self._generated_token_ids.shape[1]
+
+    @property
+    def completion_reason(self) -> StopReason | None:
+        """Return why iterative generation should finish, if applicable."""
+
+        return self._completion_reason
+
+    @property
+    def sampling_generator(self) -> torch.Generator | None:
+        """Return this request's independent seeded sampling generator."""
+
+        return self._generator
+
+    def mark_prefill_complete(self) -> None:
+        """Record successful prompt prefill."""
+
+        self._require_state(RequestState.RUNNING)
+
+        if self._prefill_complete:
+            raise RuntimeError("prefill is already complete")
+
+        self._prefill_complete = True
+
+        if self.generation_config.max_new_tokens == 0:
+            self._completion_reason = "max_new_tokens"
+
+    def build_result(self) -> GenerationResult:
+        """Build the final result after an iterative completion condition."""
+
+        self._require_state(RequestState.RUNNING)
+
+        if self._completion_reason is None:
+            raise RuntimeError("request has not reached a completion condition")
+
+        return GenerationResult(
+            token_ids=torch.cat(
+                (self._input_ids, self._generated_token_ids),
+                dim=1,
+            ),
+            generated_token_ids=self._generated_token_ids.clone(),
+            stop_reason=self._completion_reason,
+        )
+
     def mark_running(self) -> None:
         """Transition this request from waiting to running."""
 
@@ -94,10 +186,24 @@ class ScheduledRequest:
         if token_ids.device != self._input_ids.device:
             raise ValueError("generated tokens must match the prompt device")
 
+        if not self._prefill_complete:
+            raise RuntimeError("prefill must complete before generating tokens")
+
+        if self._completion_reason is not None:
+            raise RuntimeError("request has already completed generation")
+
         self._generated_token_ids = torch.cat(
             (self._generated_token_ids, token_ids),
             dim=1,
         )
+        self._next_input_token = token_ids.clone()
+
+        eos_token_id = self.generation_config.eos_token_id
+
+        if eos_token_id is not None and token_ids.item() == eos_token_id:
+            self._completion_reason = "eos"
+        elif self.num_generated_tokens >= self.generation_config.max_new_tokens:
+            self._completion_reason = "max_new_tokens"
 
     def mark_finished(self, result: GenerationResult | None = None) -> None:
         """Transition this request from running to finished."""
