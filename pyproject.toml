@@ -9,11 +9,14 @@ description = "An educational from-scratch LLM inference engine."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "fastapi",
     "numpy>=2.1,<2.4",
+    "uvicorn",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "httpx",
     "mypy",
     "pytest",
     "pytest-cov",
