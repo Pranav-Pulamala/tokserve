@@ -81,6 +81,12 @@ class RequestEventStream:
 
         return self._terminal_published
 
+    @property
+    def has_buffered_events(self) -> bool:
+        """Return whether an event can be received immediately."""
+
+        return not self._queue.empty()
+
     async def receive(self) -> GenerationEvent:
         """Wait without polling for the next event."""
 

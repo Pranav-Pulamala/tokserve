@@ -1,3 +1,4 @@
+import json
 from unittest.mock import AsyncMock
 
 import torch
@@ -193,21 +194,62 @@ def test_request_exceeding_model_context_is_rejected() -> None:
     }
 
 
-def test_streaming_request_is_not_silently_run_non_streaming() -> None:
+def test_streaming_generation_emits_tokens_before_completion() -> None:
     application = create_app(create_service())
 
     with TestClient(application) as client:
-        response = client.post(
+        with client.stream(
+            "POST",
             "/v1/generate",
             json={
                 "prompt": "1",
-                "max_new_tokens": 1,
+                "max_new_tokens": 3,
                 "stream": True,
+            },
+        ) as response:
+            lines = [line for line in response.iter_lines() if line]
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert lines[0] == "event: token"
+    assert lines[-2] == "event: done"
+    assert '"finish_reason":"max_new_tokens"' in lines[-1]
+    assert sum(line == "event: token" for line in lines) == 3
+
+
+def test_streaming_and_non_streaming_text_match() -> None:
+    service = create_service()
+    application = create_app(service)
+
+    with TestClient(application) as client:
+        complete = client.post(
+            "/v1/generate",
+            json={
+                "prompt": "1 2",
+                "max_new_tokens": 3,
             },
         )
 
-    assert response.status_code == 400
-    assert response.json() == {"detail": "streaming is not available yet"}
+        with client.stream(
+            "POST",
+            "/v1/generate",
+            json={
+                "prompt": "1 2",
+                "max_new_tokens": 3,
+                "stream": True,
+            },
+        ) as streamed:
+            data_lines = [
+                line.removeprefix("data: ")
+                for line in streamed.iter_lines()
+                if line.startswith("data: ")
+            ]
+
+    token_payloads = [json.loads(line) for line in data_lines[:-1]]
+
+    assert complete.status_code == 200
+    assert streamed.status_code == 200
+    assert token_payloads[-1]["generated_text"] == complete.json()["generated_text"]
 
 
 def test_missing_generation_service_returns_unavailable() -> None:

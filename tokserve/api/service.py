@@ -1,11 +1,21 @@
 """Asynchronous adapter over TokServe's continuous-batching engine."""
 
 import asyncio
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from itertools import count
 
 import torch
 
 from tokserve.api.schemas import GenerateRequest, GenerateResponse
+from tokserve.api.streaming import (
+    CancelledEvent,
+    DoneEvent,
+    FailureEvent,
+    GenerationEvent,
+    RequestEventBroker,
+    RequestEventStream,
+)
 from tokserve.api.tokenization import (
     Tokenizer,
     decode_generated_tokens,
@@ -23,6 +33,20 @@ class GenerationServiceError(RuntimeError):
     """Raised when the serving engine cannot complete a request."""
 
 
+@dataclass(frozen=True)
+class GenerationStreamSession:
+    """One submitted request and its isolated event stream."""
+
+    request: ScheduledRequest
+    event_stream: RequestEventStream
+
+    @property
+    def request_id(self) -> str:
+        """Return the server-generated request identifier."""
+
+        return self.request.request_id
+
+
 class GenerationService:
     """Submit API requests to one shared continuous-batching engine."""
 
@@ -30,11 +54,16 @@ class GenerationService:
         self,
         engine: ContinuousBatchEngine,
         tokenizer: Tokenizer,
+        *,
+        stream_buffer_size: int = 16,
     ) -> None:
         self.engine = engine
         self.tokenizer = tokenizer
         self._iteration_lock = asyncio.Lock()
         self._request_numbers = count(1)
+        self._event_broker = RequestEventBroker(
+            buffer_size=stream_buffer_size,
+        )
 
     async def generate(
         self,
@@ -49,12 +78,7 @@ class GenerationService:
             RequestState.RUNNING,
         ):
             try:
-                async with self._iteration_lock:
-                    if request.state in (
-                        RequestState.WAITING,
-                        RequestState.RUNNING,
-                    ):
-                        await asyncio.to_thread(self.engine.step)
+                await self._advance_engine()
             except Exception as error:
                 await self._cancel_if_active(request)
                 raise GenerationServiceError("generation engine failed") from error
@@ -80,6 +104,66 @@ class GenerationService:
             generated_tokens=result.num_generated_tokens,
             finish_reason=result.stop_reason,
         )
+
+    async def start_stream(
+        self,
+        payload: GenerateRequest,
+    ) -> GenerationStreamSession:
+        """Submit one request and register its event stream."""
+
+        request = await self._submit(payload)
+        event_stream = self._event_broker.open_stream(
+            request.request_id,
+        )
+        return GenerationStreamSession(
+            request=request,
+            event_stream=event_stream,
+        )
+
+    async def stream_events(
+        self,
+        session: GenerationStreamSession,
+    ) -> AsyncIterator[GenerationEvent]:
+        """Advance generation and yield observable events as they occur."""
+
+        request = session.request
+        event_stream = session.event_stream
+
+        try:
+            while True:
+                if not event_stream.has_buffered_events:
+                    try:
+                        await self._advance_engine()
+                    except Exception:
+                        await self._cancel_if_active(request)
+                        self._event_broker.publish_failure(
+                            request.request_id,
+                            message="generation failed",
+                        )
+
+                event = await event_stream.receive()
+                yield event
+
+                if isinstance(
+                    event,
+                    (DoneEvent, CancelledEvent, FailureEvent),
+                ):
+                    break
+        finally:
+            if event_stream.terminal_published:
+                self._event_broker.remove_stream(
+                    request.request_id,
+                )
+
+    async def _advance_engine(self) -> None:
+        """Run one shared engine iteration and publish streaming progress."""
+
+        async with self._iteration_lock:
+            await asyncio.to_thread(self.engine.step)
+
+            for request_id in self._event_broker.active_request_ids:
+                request = self.engine.scheduler.get_request(request_id)
+                self._event_broker.publish_progress(request)
 
     async def _submit(
         self,
