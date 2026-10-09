@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock
 
 import torch
@@ -11,7 +12,11 @@ from tokserve.api.service import (
     GenerationService,
     GenerationServiceError,
 )
-from tokserve.api.streaming import TokenEvent
+from tokserve.api.streaming import (
+    DoneEvent,
+    GenerationEvent,
+    TokenEvent,
+)
 from tokserve.batching.engine import ContinuousBatchEngine
 from tokserve.engine.model import LlamaModel
 from tokserve.engine.paged.manager import PagedKVCacheManager
@@ -349,3 +354,106 @@ def test_shutdown_cancels_waiting_streams() -> None:
     assert service.engine.scheduler.waiting_count == 0
     assert service.engine.scheduler.running_count == 0
     assert service.active_stream_request_ids == ()
+
+
+def test_multiple_streams_remain_isolated() -> None:
+    service = create_service()
+
+    async def collect(
+        session_id: str,
+        events: list[GenerationEvent],
+    ) -> tuple[str, list[GenerationEvent]]:
+        return session_id, events
+
+    async def run() -> tuple[
+        tuple[str, list[GenerationEvent]],
+        tuple[str, list[GenerationEvent]],
+    ]:
+        first_session = await service.start_stream(
+            GenerateRequest(
+                prompt="1",
+                max_new_tokens=3,
+                stream=True,
+            )
+        )
+        second_session = await service.start_stream(
+            GenerateRequest(
+                prompt="2",
+                max_new_tokens=2,
+                stream=True,
+            )
+        )
+
+        async def consume(
+            session_id: str,
+            session_events: AsyncIterator[GenerationEvent],
+        ) -> tuple[str, list[GenerationEvent]]:
+            collected = [event async for event in session_events]
+            return await collect(session_id, collected)
+
+        return await asyncio.gather(
+            consume(
+                first_session.request_id,
+                service.stream_events(first_session),
+            ),
+            consume(
+                second_session.request_id,
+                service.stream_events(second_session),
+            ),
+        )
+
+    first, second = asyncio.run(run())
+
+    first_id, first_events = first
+    second_id, second_events = second
+
+    assert first_id != second_id
+    assert sum(isinstance(event, TokenEvent) for event in first_events) == 3
+    assert sum(isinstance(event, TokenEvent) for event in second_events) == 2
+    assert isinstance(first_events[-1], DoneEvent)
+    assert isinstance(second_events[-1], DoneEvent)
+    assert service.active_stream_request_ids == ()
+    assert service.engine.scheduler.waiting_count == 0
+    assert service.engine.scheduler.running_count == 0
+    assert service.engine.cache_manager.allocator.allocated_count == 0
+
+
+def test_invalid_streaming_request_is_rejected_before_sse_starts() -> None:
+    application = create_app(create_service())
+
+    with TestClient(application) as client:
+        response = client.post(
+            "/v1/generate",
+            json={
+                "prompt": "1 2 3 4 5 6 7 8 9 10",
+                "max_new_tokens": 10,
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json() == {
+        "detail": ("prompt and generation exceed model context length")
+    }
+
+
+def test_streaming_response_uses_security_headers() -> None:
+    application = create_app(create_service())
+
+    with TestClient(application) as client:
+        with client.stream(
+            "POST",
+            "/v1/generate",
+            json={
+                "prompt": "1",
+                "max_new_tokens": 1,
+                "stream": True,
+            },
+        ) as response:
+            list(response.iter_lines())
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["content-type"].startswith("text/event-stream")
