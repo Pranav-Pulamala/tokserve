@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock
 
@@ -10,12 +11,14 @@ from tokserve.api.service import (
     GenerationService,
     GenerationServiceError,
 )
+from tokserve.api.streaming import TokenEvent
 from tokserve.batching.engine import ContinuousBatchEngine
 from tokserve.engine.model import LlamaModel
 from tokserve.engine.paged.manager import PagedKVCacheManager
 from tokserve.generation.generate import generate
 from tokserve.generation.types import GenerationConfig
 from tokserve.reference.llama.config import LlamaConfig
+from tokserve.scheduler.request import RequestState
 from tokserve.scheduler.scheduler import RequestScheduler
 
 
@@ -296,3 +299,53 @@ def test_schema_conversion_used_by_service() -> None:
     )
 
     assert payload.to_generation_config().max_new_tokens == 2
+
+
+def test_closing_stream_cancels_request_and_releases_resources() -> None:
+    service = create_service()
+
+    async def run() -> RequestState:
+        session = await service.start_stream(
+            GenerateRequest(
+                prompt="1",
+                max_new_tokens=3,
+                stream=True,
+            )
+        )
+        events = service.stream_events(session)
+
+        first_event = await anext(events)
+        assert isinstance(first_event, TokenEvent)
+
+        await events.aclose()
+        return session.request.state
+
+    state = asyncio.run(run())
+
+    assert state is RequestState.CANCELLED
+    assert service.engine.scheduler.waiting_count == 0
+    assert service.engine.scheduler.running_count == 0
+    assert service.engine.cache_manager.allocator.allocated_count == 0
+    assert service.active_stream_request_ids == ()
+
+
+def test_shutdown_cancels_waiting_streams() -> None:
+    service = create_service()
+
+    async def run() -> RequestState:
+        session = await service.start_stream(
+            GenerateRequest(
+                prompt="1",
+                max_new_tokens=3,
+                stream=True,
+            )
+        )
+        await service.shutdown()
+        return session.request.state
+
+    state = asyncio.run(run())
+
+    assert state is RequestState.CANCELLED
+    assert service.engine.scheduler.waiting_count == 0
+    assert service.engine.scheduler.running_count == 0
+    assert service.active_stream_request_ids == ()

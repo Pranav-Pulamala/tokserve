@@ -15,6 +15,7 @@ from tokserve.api.streaming import (
     GenerationEvent,
     RequestEventBroker,
     RequestEventStream,
+    StreamBackpressureError,
 )
 from tokserve.api.tokenization import (
     Tokenizer,
@@ -64,6 +65,12 @@ class GenerationService:
         self._event_broker = RequestEventBroker(
             buffer_size=stream_buffer_size,
         )
+
+    @property
+    def active_stream_request_ids(self) -> tuple[str, ...]:
+        """Return request IDs with registered event streams."""
+
+        return self._event_broker.active_request_ids
 
     async def generate(
         self,
@@ -136,7 +143,7 @@ class GenerationService:
                         await self._advance_engine()
                     except Exception:
                         await self._cancel_if_active(request)
-                        self._event_broker.publish_failure(
+                        self._event_broker.replace_with_failure(
                             request.request_id,
                             message="generation failed",
                         )
@@ -150,8 +157,10 @@ class GenerationService:
                 ):
                     break
         finally:
-            if event_stream.terminal_published:
-                self._event_broker.remove_stream(
+            await self._cancel_if_active(request)
+
+            if request.request_id in self._event_broker.active_request_ids:
+                self._event_broker.discard_stream(
                     request.request_id,
                 )
 
@@ -161,9 +170,41 @@ class GenerationService:
         async with self._iteration_lock:
             await asyncio.to_thread(self.engine.step)
 
-            for request_id in self._event_broker.active_request_ids:
+            for request_id in tuple(self._event_broker.active_request_ids):
                 request = self.engine.scheduler.get_request(request_id)
-                self._event_broker.publish_progress(request)
+
+                try:
+                    self._event_broker.publish_progress(request)
+                except StreamBackpressureError:
+                    if request.state in (
+                        RequestState.WAITING,
+                        RequestState.RUNNING,
+                    ):
+                        self.engine.scheduler.cancel(request_id)
+
+                    self._event_broker.replace_with_failure(
+                        request_id,
+                        message="stream consumer is too slow",
+                    )
+
+    async def shutdown(self) -> None:
+        """Cancel active work and discard registered streams."""
+
+        async with self._iteration_lock:
+            active_requests = (
+                self.engine.scheduler.waiting_requests
+                + self.engine.scheduler.running_requests
+            )
+
+            for request in active_requests:
+                if request.state in (
+                    RequestState.WAITING,
+                    RequestState.RUNNING,
+                ):
+                    self.engine.scheduler.cancel(request.request_id)
+
+            for request_id in tuple(self._event_broker.active_request_ids):
+                self._event_broker.discard_stream(request_id)
 
     async def _submit(
         self,
@@ -211,7 +252,7 @@ class GenerationService:
         self,
         request: ScheduledRequest,
     ) -> None:
-        """Cancel a failed request through scheduler ownership."""
+        """Cancel a failed or abandoned active request."""
 
         async with self._iteration_lock:
             if request.state in (

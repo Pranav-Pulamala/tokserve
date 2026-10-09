@@ -109,6 +109,20 @@ class RequestEventStream:
         ):
             self._terminal_published = True
 
+    def _replace_with_failure(
+        self,
+        event: FailureEvent,
+    ) -> None:
+        """Discard buffered progress and install one failure event."""
+
+        while True:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        self._publish(event)
+
 
 @dataclass
 class _Registration:
@@ -191,6 +205,25 @@ class RequestEventBroker:
 
         if not registration.stream.terminal_published:
             registration.stream._publish(FailureEvent(message=message))
+
+    def replace_with_failure(
+        self,
+        request_id: str,
+        *,
+        message: str = "generation failed",
+    ) -> None:
+        """Replace pending events with a terminal sanitized failure."""
+
+        registration = self._get_registration(request_id)
+
+        if not registration.stream.terminal_published:
+            registration.stream._replace_with_failure(FailureEvent(message=message))
+
+    def discard_stream(self, request_id: str) -> None:
+        """Remove a stream during disconnect or application cleanup."""
+
+        self._get_registration(request_id)
+        del self._registrations[request_id]
 
     def remove_stream(self, request_id: str) -> None:
         """Remove one registered terminal stream."""

@@ -168,3 +168,28 @@ def test_nonterminal_stream_cannot_be_removed() -> None:
 
     with pytest.raises(RuntimeError, match="nonterminal"):
         broker.remove_stream("A")
+
+
+def test_failure_replaces_events_when_buffer_is_full() -> None:
+    broker = RequestEventBroker(buffer_size=1)
+    stream = broker.open_stream("A")
+    request = create_running_request("A")
+    request.append_generated_token(torch.tensor([[2]], dtype=torch.int64))
+
+    broker.publish_progress(request)
+    broker.replace_with_failure(
+        "A",
+        message="stream consumer is too slow",
+    )
+
+    assert receive(stream) == FailureEvent(message="stream consumer is too slow")
+    assert stream.terminal_published is True
+
+
+def test_stream_can_be_discarded_during_disconnect() -> None:
+    broker = RequestEventBroker()
+    broker.open_stream("A")
+
+    broker.discard_stream("A")
+
+    assert broker.active_request_ids == ()

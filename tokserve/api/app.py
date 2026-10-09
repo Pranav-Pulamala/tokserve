@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import cast
 
 from fastapi import FastAPI, HTTPException, status
@@ -27,9 +28,21 @@ def create_app(
 ) -> FastAPI:
     """Create a TokServe application with injectable inference state."""
 
+    @asynccontextmanager
+    async def lifespan(
+        _: FastAPI,
+    ) -> AsyncIterator[None]:
+        """Release serving resources during application shutdown."""
+
+        yield
+
+        if generation_service is not None:
+            await generation_service.shutdown()
+
     application = FastAPI(
         title="TokServe",
         version="0.1.0",
+        lifespan=lifespan,
     )
     application.state.generation_service = generation_service
 
