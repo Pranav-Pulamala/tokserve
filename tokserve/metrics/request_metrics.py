@@ -39,7 +39,7 @@ def _validate_timestamp(
     name: str,
     value: float | None,
 ) -> None:
-    """Reject non-finite or negative monotonic timestamp values."""
+    """Reject non-finite or negative monotonic timestamps."""
 
     if value is None:
         return
@@ -105,24 +105,52 @@ class RequestMetrics:
             raise ValueError("only completed requests have a completion_reason")
 
         timeline: list[tuple[str, float]] = [
-            ("request_received", self.request_received)
+            (
+                "request_received",
+                self.request_received,
+            )
         ]
 
         optional_events = (
-            ("request_admitted", self.request_admitted),
-            ("prefill_start", self.prefill_start),
-            ("prefill_end", self.prefill_end),
+            (
+                "request_admitted",
+                self.request_admitted,
+            ),
+            (
+                "prefill_start",
+                self.prefill_start,
+            ),
+            (
+                "prefill_end",
+                self.prefill_end,
+            ),
         )
 
-        for event_name, event_timestamp in optional_events:
+        for (
+            event_name,
+            event_timestamp,
+        ) in optional_events:
             if event_timestamp is not None:
-                timeline.append((event_name, event_timestamp))
+                timeline.append(
+                    (
+                        event_name,
+                        event_timestamp,
+                    )
+                )
 
         timeline.extend(
-            ("token_produced", token_timestamp)
-            for token_timestamp in self.token_produced_times
+            (
+                "token_produced",
+                token_timestamp,
+            )
+            for token_timestamp in (self.token_produced_times)
         )
-        timeline.append(("request_finished", self.request_finished))
+        timeline.append(
+            (
+                "request_finished",
+                self.request_finished,
+            )
+        )
 
         for (
             previous_name,
@@ -136,13 +164,13 @@ class RequestMetrics:
 
     @property
     def generated_tokens(self) -> int:
-        """Return the number of observed generated tokens."""
+        """Return the number of generated tokens."""
 
         return len(self.token_produced_times)
 
     @property
     def queue_delay_seconds(self) -> float | None:
-        """Return acceptance-to-admission queueing delay."""
+        """Return acceptance-to-admission queue delay."""
 
         return _duration(
             self.request_received,
@@ -150,8 +178,10 @@ class RequestMetrics:
         )
 
     @property
-    def prefill_duration_seconds(self) -> float | None:
-        """Return CPU-observed prefill call duration."""
+    def prefill_duration_seconds(
+        self,
+    ) -> float | None:
+        """Return CPU-observed prefill duration."""
 
         return _duration(
             self.prefill_start,
@@ -160,7 +190,7 @@ class RequestMetrics:
 
     @property
     def ttft_seconds(self) -> float | None:
-        """Return acceptance-to-first-produced-token latency."""
+        """Return acceptance-to-first-token latency."""
 
         if not self.token_produced_times:
             return None
@@ -172,7 +202,7 @@ class RequestMetrics:
 
     @property
     def request_latency_seconds(self) -> float:
-        """Return acceptance-to-terminal server generation latency."""
+        """Return acceptance-to-terminal latency."""
 
         elapsed = _duration(
             self.request_received,
@@ -188,7 +218,7 @@ class RequestMetrics:
     def inter_token_latencies_seconds(
         self,
     ) -> tuple[float, ...]:
-        """Return elapsed durations between produced tokens."""
+        """Return durations between produced tokens."""
 
         return tuple(
             current - previous
@@ -199,8 +229,10 @@ class RequestMetrics:
         )
 
     @property
-    def output_tokens_per_second(self) -> float | None:
-        """Return tokens divided by total server generation latency."""
+    def output_tokens_per_second(
+        self,
+    ) -> float | None:
+        """Return tokens divided by server request latency."""
 
         if self.generated_tokens == 0:
             return None
@@ -215,7 +247,7 @@ class RequestMetrics:
 
 @dataclass(frozen=True)
 class MetricsSnapshot:
-    """Immutable aggregate counter and bounded-history snapshot."""
+    """Immutable aggregate and history snapshot."""
 
     requests_received: int
     requests_admitted: int
@@ -224,10 +256,15 @@ class MetricsSnapshot:
     requests_cancelled: int
     generated_output_tokens: int
     active_requests: int
+    iterations: int
+    prefill_requests: int
+    decode_requests: int
+    last_batch_size: int
+    maximum_batch_size: int
     completed_records: tuple[RequestMetrics, ...]
 
     def __post_init__(self) -> None:
-        """Reject impossible negative aggregate values."""
+        """Reject impossible negative values."""
 
         values = (
             self.requests_received,
@@ -237,6 +274,11 @@ class MetricsSnapshot:
             self.requests_cancelled,
             self.generated_output_tokens,
             self.active_requests,
+            self.iterations,
+            self.prefill_requests,
+            self.decode_requests,
+            self.last_batch_size,
+            self.maximum_batch_size,
         )
 
         if any(value < 0 for value in values):
@@ -251,7 +293,7 @@ class MetricsSnapshot:
 
 @dataclass
 class _ActiveRequestMetrics:
-    """Mutable timing state retained only while a request is active."""
+    """Mutable state retained while a request is active."""
 
     request_id: str
     request_received: float
@@ -262,7 +304,7 @@ class _ActiveRequestMetrics:
 
     @property
     def latest_timestamp(self) -> float:
-        """Return the latest recorded lifecycle timestamp."""
+        """Return the latest lifecycle timestamp."""
 
         timestamps = [self.request_received]
 
@@ -280,7 +322,7 @@ class _ActiveRequestMetrics:
 
 
 class RequestMetricsCollector:
-    """Collect bounded request observations with thread-safe counters."""
+    """Collect bounded, thread-safe request observations."""
 
     def __init__(
         self,
@@ -293,19 +335,33 @@ class RequestMetricsCollector:
 
         self._clock = clock
         self._history_size = history_size
-        self._active: dict[str, _ActiveRequestMetrics] = {}
+        self._active: dict[
+            str,
+            _ActiveRequestMetrics,
+        ] = {}
         self._history: deque[RequestMetrics] = deque()
-        self._terminal_records: dict[str, RequestMetrics] = {}
+        self._terminal_records: dict[
+            str,
+            RequestMetrics,
+        ] = {}
         self._requests_received = 0
         self._requests_admitted = 0
         self._requests_completed = 0
         self._requests_failed = 0
         self._requests_cancelled = 0
         self._generated_output_tokens = 0
+        self._iterations = 0
+        self._prefill_requests = 0
+        self._decode_requests = 0
+        self._last_batch_size = 0
+        self._maximum_batch_size = 0
         self._lock = Lock()
 
-    def request_received(self, request_id: str) -> None:
-        """Start timing one accepted, validated request."""
+    def request_received(
+        self,
+        request_id: str,
+    ) -> None:
+        """Start timing one accepted request."""
 
         if not request_id:
             raise ValueError("request_id must be nonempty")
@@ -321,7 +377,10 @@ class RequestMetricsCollector:
             )
             self._requests_received += 1
 
-    def request_admitted(self, request_id: str) -> None:
+    def request_admitted(
+        self,
+        request_id: str,
+    ) -> None:
         """Record scheduler admission."""
 
         with self._lock:
@@ -333,8 +392,11 @@ class RequestMetricsCollector:
             observation.request_admitted = self._next_timestamp(observation)
             self._requests_admitted += 1
 
-    def prefill_started(self, request_id: str) -> None:
-        """Record the start of the model prefill call."""
+    def prefill_started(
+        self,
+        request_id: str,
+    ) -> None:
+        """Record model prefill start."""
 
         with self._lock:
             observation = self._get_active(request_id)
@@ -347,8 +409,11 @@ class RequestMetricsCollector:
 
             observation.prefill_start = self._next_timestamp(observation)
 
-    def prefill_finished(self, request_id: str) -> None:
-        """Record completion of the model prefill call."""
+    def prefill_finished(
+        self,
+        request_id: str,
+    ) -> None:
+        """Record model prefill completion."""
 
         with self._lock:
             observation = self._get_active(request_id)
@@ -361,8 +426,11 @@ class RequestMetricsCollector:
 
             observation.prefill_end = self._next_timestamp(observation)
 
-    def token_produced(self, request_id: str) -> None:
-        """Record one generated output token timestamp."""
+    def token_produced(
+        self,
+        request_id: str,
+    ) -> None:
+        """Record one generated output token."""
 
         with self._lock:
             observation = self._get_active(request_id)
@@ -379,7 +447,7 @@ class RequestMetricsCollector:
         request_id: str,
         completion_reason: StopReason,
     ) -> RequestMetrics:
-        """Record one successful terminal request."""
+        """Record successful request completion."""
 
         return self._finish_request(
             request_id,
@@ -391,7 +459,7 @@ class RequestMetricsCollector:
         self,
         request_id: str,
     ) -> RequestMetrics:
-        """Record one failed terminal request."""
+        """Record a failed request."""
 
         return self._finish_request(
             request_id,
@@ -402,25 +470,53 @@ class RequestMetricsCollector:
         self,
         request_id: str,
     ) -> RequestMetrics:
-        """Record one cancelled terminal request."""
+        """Record a cancelled request."""
 
         return self._finish_request(
             request_id,
             outcome="cancelled",
         )
 
+    def record_iteration(
+        self,
+        *,
+        prefill_requests: int,
+        decode_requests: int,
+    ) -> None:
+        """Record one continuous-batching iteration."""
+
+        if prefill_requests < 0 or decode_requests < 0:
+            raise ValueError("iteration request counts must be nonnegative")
+
+        batch_size = prefill_requests + decode_requests
+
+        with self._lock:
+            self._iterations += 1
+            self._prefill_requests += prefill_requests
+            self._decode_requests += decode_requests
+            self._last_batch_size = batch_size
+            self._maximum_batch_size = max(
+                self._maximum_batch_size,
+                batch_size,
+            )
+
     def snapshot(self) -> MetricsSnapshot:
-        """Return counters and an immutable bounded history copy."""
+        """Return immutable counters and history."""
 
         with self._lock:
             return MetricsSnapshot(
-                requests_received=self._requests_received,
-                requests_admitted=self._requests_admitted,
-                requests_completed=self._requests_completed,
-                requests_failed=self._requests_failed,
-                requests_cancelled=self._requests_cancelled,
+                requests_received=(self._requests_received),
+                requests_admitted=(self._requests_admitted),
+                requests_completed=(self._requests_completed),
+                requests_failed=(self._requests_failed),
+                requests_cancelled=(self._requests_cancelled),
                 generated_output_tokens=(self._generated_output_tokens),
                 active_requests=len(self._active),
+                iterations=self._iterations,
+                prefill_requests=(self._prefill_requests),
+                decode_requests=(self._decode_requests),
+                last_batch_size=(self._last_batch_size),
+                maximum_batch_size=(self._maximum_batch_size),
                 completed_records=tuple(self._history),
             )
 
@@ -431,7 +527,7 @@ class RequestMetricsCollector:
         outcome: RequestOutcome,
         completion_reason: StopReason | None = None,
     ) -> RequestMetrics:
-        """Create one terminal record without double-counting."""
+        """Create a terminal record exactly once."""
 
         with self._lock:
             existing = self._terminal_records.get(request_id)
@@ -445,12 +541,12 @@ class RequestMetricsCollector:
                 request_id=request_id,
                 request_received=(observation.request_received),
                 request_admitted=(observation.request_admitted),
-                prefill_start=observation.prefill_start,
-                prefill_end=observation.prefill_end,
+                prefill_start=(observation.prefill_start),
+                prefill_end=(observation.prefill_end),
                 token_produced_times=tuple(observation.token_produced_times),
                 request_finished=finished,
                 outcome=outcome,
-                completion_reason=completion_reason,
+                completion_reason=(completion_reason),
             )
 
             del self._active[request_id]
@@ -478,7 +574,7 @@ class RequestMetricsCollector:
         self,
         request_id: str,
     ) -> _ActiveRequestMetrics:
-        """Return active timing state for one request."""
+        """Return active state for one request."""
 
         try:
             return self._active[request_id]
@@ -489,7 +585,7 @@ class RequestMetricsCollector:
         self,
         observation: _ActiveRequestMetrics,
     ) -> float:
-        """Read and validate the next lifecycle timestamp."""
+        """Read and validate a lifecycle timestamp."""
 
         timestamp = self._read_clock()
 
@@ -499,8 +595,11 @@ class RequestMetricsCollector:
         return timestamp
 
     def _read_clock(self) -> float:
-        """Read one finite, nonnegative clock value."""
+        """Read a finite nonnegative clock value."""
 
         timestamp = self._clock()
-        _validate_timestamp("clock value", timestamp)
+        _validate_timestamp(
+            "clock value",
+            timestamp,
+        )
         return timestamp

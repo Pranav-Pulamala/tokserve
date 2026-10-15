@@ -1,28 +1,31 @@
-"""Iteration-level prefill and decode execution primitives."""
+"""Execute planned prefill and decode work."""
 
 from collections.abc import Sequence
 
-import torch
-
 from tokserve.engine.model import LlamaModel
-from tokserve.engine.paged.inference import decode_paged, prefill_paged
+from tokserve.engine.paged.inference import (
+    decode_paged,
+    prefill_paged,
+)
 from tokserve.engine.paged.manager import PagedKVCacheManager
 from tokserve.generation.sampling import select_next_token
-from tokserve.scheduler.request import RequestState, ScheduledRequest
+from tokserve.metrics.request_metrics import (
+    RequestMetricsCollector,
+)
+from tokserve.scheduler.request import (
+    RequestState,
+    ScheduledRequest,
+)
 
 
-@torch.inference_mode()
 def execute_prefill(
     model: LlamaModel,
     manager: PagedKVCacheManager,
     requests: Sequence[ScheduledRequest],
+    *,
+    metrics: RequestMetricsCollector | None = None,
 ) -> tuple[str, ...]:
-    """Prefill each eligible request once during one engine iteration.
-
-    The current paged model interface owns one cache per batch-size-one
-    sequence. Requests therefore share an engine iteration while retaining
-    separate model calls and separate paged-cache ownership.
-    """
+    """Prefill requests and select their first output token."""
 
     _validate_prefill_requests(requests)
     completed_ids: list[str] = []
@@ -33,21 +36,29 @@ def execute_prefill(
             completed_ids.append(request.request_id)
             continue
 
-        prefill_result = prefill_paged(
+        if metrics is not None:
+            metrics.prefill_started(request.request_id)
+
+        result = prefill_paged(
             model,
             request.input_ids,
             manager,
             sequence_id=request.request_id,
         )
-        next_token_logits = prefill_result.logits[:, -1, :]
+
+        if metrics is not None:
+            metrics.prefill_finished(request.request_id)
+
+        request.mark_prefill_complete()
         next_token = select_next_token(
-            next_token_logits,
+            result.logits[:, -1, :],
             request.generation_config,
             generator=request.sampling_generator,
         )
-
-        request.mark_prefill_complete()
         request.append_generated_token(next_token)
+
+        if metrics is not None:
+            metrics.token_produced(request.request_id)
 
         if request.completion_reason is not None:
             completed_ids.append(request.request_id)
@@ -55,13 +66,14 @@ def execute_prefill(
     return tuple(completed_ids)
 
 
-@torch.inference_mode()
 def execute_decode(
     model: LlamaModel,
     manager: PagedKVCacheManager,
     requests: Sequence[ScheduledRequest],
+    *,
+    metrics: RequestMetricsCollector | None = None,
 ) -> tuple[str, ...]:
-    """Advance every decode-ready request by exactly one token step."""
+    """Advance decode-ready requests by one token step."""
 
     _validate_decode_requests(requests)
     completed_ids: list[str] = []
@@ -80,6 +92,9 @@ def execute_decode(
         )
         request.append_generated_token(next_token)
 
+        if metrics is not None:
+            metrics.token_produced(request.request_id)
+
         if request.completion_reason is not None:
             completed_ids.append(request.request_id)
 
@@ -89,7 +104,7 @@ def execute_decode(
 def _validate_decode_requests(
     requests: Sequence[ScheduledRequest],
 ) -> None:
-    """Validate a complete decode work group before mutating it."""
+    """Validate a decode work group before mutating it."""
 
     seen_ids: set[str] = set()
 
@@ -109,7 +124,7 @@ def _validate_decode_requests(
 def _validate_prefill_requests(
     requests: Sequence[ScheduledRequest],
 ) -> None:
-    """Validate a complete prefill work group before mutating it."""
+    """Validate a prefill work group before mutating it."""
 
     seen_ids: set[str] = set()
 

@@ -7,7 +7,10 @@ from itertools import count
 
 import torch
 
-from tokserve.api.schemas import GenerateRequest, GenerateResponse
+from tokserve.api.schemas import (
+    GenerateRequest,
+    GenerateResponse,
+)
 from tokserve.api.streaming import (
     CancelledEvent,
     DoneEvent,
@@ -23,7 +26,13 @@ from tokserve.api.tokenization import (
     encode_prompt,
 )
 from tokserve.batching.engine import ContinuousBatchEngine
-from tokserve.scheduler.request import RequestState, ScheduledRequest
+from tokserve.metrics.request_metrics import (
+    RequestMetricsCollector,
+)
+from tokserve.scheduler.request import (
+    RequestState,
+    ScheduledRequest,
+)
 
 
 class RequestRejectedError(ValueError):
@@ -57,9 +66,26 @@ class GenerationService:
         tokenizer: Tokenizer,
         *,
         stream_buffer_size: int = 16,
+        metrics: RequestMetricsCollector | None = None,
     ) -> None:
         self.engine = engine
         self.tokenizer = tokenizer
+
+        if (
+            metrics is not None
+            and engine.metrics is not None
+            and metrics is not engine.metrics
+        ):
+            raise ValueError("service and engine must share metrics")
+
+        if metrics is None:
+            metrics = engine.metrics
+
+        if metrics is None:
+            metrics = RequestMetricsCollector()
+
+        self.metrics = metrics
+        self.engine.metrics = metrics
         self._iteration_lock = asyncio.Lock()
         self._request_numbers = count(1)
         self._event_broker = RequestEventBroker(
@@ -67,7 +93,9 @@ class GenerationService:
         )
 
     @property
-    def active_stream_request_ids(self) -> tuple[str, ...]:
+    def active_stream_request_ids(
+        self,
+    ) -> tuple[str, ...]:
         """Return request IDs with registered event streams."""
 
         return self._event_broker.active_request_ids
@@ -87,7 +115,7 @@ class GenerationService:
             try:
                 await self._advance_engine()
             except Exception as error:
-                await self._cancel_if_active(request)
+                await self._fail_if_active(request)
                 raise GenerationServiceError("generation engine failed") from error
 
             await asyncio.sleep(0)
@@ -108,7 +136,7 @@ class GenerationService:
                 self.tokenizer,
                 result.generated_token_ids,
             ),
-            generated_tokens=result.num_generated_tokens,
+            generated_tokens=(result.num_generated_tokens),
             finish_reason=result.stop_reason,
         )
 
@@ -131,7 +159,7 @@ class GenerationService:
         self,
         session: GenerationStreamSession,
     ) -> AsyncIterator[GenerationEvent]:
-        """Advance generation and yield observable events as they occur."""
+        """Advance generation and yield observable events."""
 
         request = session.request
         event_stream = session.event_stream
@@ -142,7 +170,7 @@ class GenerationService:
                     try:
                         await self._advance_engine()
                     except Exception:
-                        await self._cancel_if_active(request)
+                        await self._fail_if_active(request)
                         self._event_broker.replace_with_failure(
                             request.request_id,
                             message="generation failed",
@@ -153,7 +181,11 @@ class GenerationService:
 
                 if isinstance(
                     event,
-                    (DoneEvent, CancelledEvent, FailureEvent),
+                    (
+                        DoneEvent,
+                        CancelledEvent,
+                        FailureEvent,
+                    ),
                 ):
                     break
         finally:
@@ -165,7 +197,7 @@ class GenerationService:
                 )
 
     async def _advance_engine(self) -> None:
-        """Run one shared engine iteration and publish streaming progress."""
+        """Run one engine iteration and publish stream progress."""
 
         async with self._iteration_lock:
             await asyncio.to_thread(self.engine.step)
@@ -181,10 +213,11 @@ class GenerationService:
                         RequestState.RUNNING,
                     ):
                         self.engine.scheduler.cancel(request_id)
+                        self.metrics.cancel_request(request_id)
 
                     self._event_broker.replace_with_failure(
                         request_id,
-                        message="stream consumer is too slow",
+                        message=("stream consumer is too slow"),
                     )
 
     async def shutdown(self) -> None:
@@ -202,6 +235,7 @@ class GenerationService:
                     RequestState.RUNNING,
                 ):
                     self.engine.scheduler.cancel(request.request_id)
+                    self.metrics.cancel_request(request.request_id)
 
             for request_id in tuple(self._event_broker.active_request_ids):
                 self._event_broker.discard_stream(request_id)
@@ -242,9 +276,14 @@ class GenerationService:
             input_ids,
             payload.to_generation_config(),
         )
+        self.metrics.request_received(request.request_id)
 
-        async with self._iteration_lock:
-            self.engine.scheduler.submit(request)
+        try:
+            async with self._iteration_lock:
+                self.engine.scheduler.submit(request)
+        except Exception:
+            self.metrics.fail_request(request.request_id)
+            raise
 
         return request
 
@@ -252,7 +291,7 @@ class GenerationService:
         self,
         request: ScheduledRequest,
     ) -> None:
-        """Cancel a failed or abandoned active request."""
+        """Cancel an abandoned active request."""
 
         async with self._iteration_lock:
             if request.state in (
@@ -260,3 +299,18 @@ class GenerationService:
                 RequestState.RUNNING,
             ):
                 self.engine.scheduler.cancel(request.request_id)
+                self.metrics.cancel_request(request.request_id)
+
+    async def _fail_if_active(
+        self,
+        request: ScheduledRequest,
+    ) -> None:
+        """Release an active failed request and record failure."""
+
+        async with self._iteration_lock:
+            if request.state in (
+                RequestState.WAITING,
+                RequestState.RUNNING,
+            ):
+                self.engine.scheduler.cancel(request.request_id)
+                self.metrics.fail_request(request.request_id)

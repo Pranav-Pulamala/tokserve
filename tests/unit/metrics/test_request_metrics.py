@@ -9,9 +9,12 @@ from tokserve.metrics.request_metrics import (
 
 
 class FakeClock:
-    """Return explicit deterministic monotonic timestamps."""
+    """Return explicit deterministic timestamps."""
 
-    def __init__(self, timestamps: Iterable[float]) -> None:
+    def __init__(
+        self,
+        timestamps: Iterable[float],
+    ) -> None:
         self._timestamps = iter(timestamps)
 
     def __call__(self) -> float:
@@ -74,15 +77,26 @@ def test_one_token_has_ttft_but_no_itl() -> None:
     collector.prefill_started("A")
     collector.prefill_finished("A")
     collector.token_produced("A")
-    record = collector.complete_request("A", "eos")
+    record = collector.complete_request(
+        "A",
+        "eos",
+    )
 
     assert record.ttft_seconds == 4.0
     assert record.inter_token_latencies_seconds == ()
     assert record.generated_tokens == 1
 
 
-def test_zero_token_completion_has_no_ttft_or_throughput() -> None:
-    collector = RequestMetricsCollector(clock=FakeClock([0.0, 1.0, 2.0]))
+def test_zero_token_completion_has_no_ttft() -> None:
+    collector = RequestMetricsCollector(
+        clock=FakeClock(
+            [
+                0.0,
+                1.0,
+                2.0,
+            ]
+        )
+    )
 
     collector.request_received("A")
     collector.request_admitted("A")
@@ -98,7 +112,15 @@ def test_zero_token_completion_has_no_ttft_or_throughput() -> None:
 
 
 def test_cancellation_preserves_observed_timing() -> None:
-    collector = RequestMetricsCollector(clock=FakeClock([3.0, 5.0, 8.0]))
+    collector = RequestMetricsCollector(
+        clock=FakeClock(
+            [
+                3.0,
+                5.0,
+                8.0,
+            ]
+        )
+    )
 
     collector.request_received("A")
     collector.request_admitted("A")
@@ -110,12 +132,20 @@ def test_cancellation_preserves_observed_timing() -> None:
     assert record.ttft_seconds is None
 
     snapshot = collector.snapshot()
+
     assert snapshot.requests_cancelled == 1
     assert snapshot.terminal_requests == 1
 
 
 def test_failure_is_distinct_from_cancellation() -> None:
-    collector = RequestMetricsCollector(clock=FakeClock([1.0, 2.0]))
+    collector = RequestMetricsCollector(
+        clock=FakeClock(
+            [
+                1.0,
+                2.0,
+            ]
+        )
+    )
 
     collector.request_received("A")
     record = collector.fail_request("A")
@@ -123,13 +153,21 @@ def test_failure_is_distinct_from_cancellation() -> None:
     assert record.outcome == "failed"
 
     snapshot = collector.snapshot()
+
     assert snapshot.requests_failed == 1
     assert snapshot.requests_cancelled == 0
     assert snapshot.requests_completed == 0
 
 
 def test_repeated_terminal_event_is_idempotent() -> None:
-    collector = RequestMetricsCollector(clock=FakeClock([0.0, 1.0]))
+    collector = RequestMetricsCollector(
+        clock=FakeClock(
+            [
+                0.0,
+                1.0,
+            ]
+        )
+    )
 
     collector.request_received("A")
     first = collector.cancel_request("A")
@@ -138,12 +176,13 @@ def test_repeated_terminal_event_is_idempotent() -> None:
     assert second is first
 
     snapshot = collector.snapshot()
+
     assert snapshot.requests_cancelled == 1
     assert snapshot.terminal_requests == 1
     assert len(snapshot.completed_records) == 1
 
 
-def test_history_is_bounded_and_evicts_oldest_record() -> None:
+def test_history_is_bounded() -> None:
     collector = RequestMetricsCollector(
         clock=FakeClock(
             [
@@ -178,7 +217,6 @@ def test_snapshot_counts_tokens_and_active_requests() -> None:
                 2.0,
                 3.0,
                 4.0,
-                5.0,
             ]
         )
     )
@@ -198,8 +236,49 @@ def test_snapshot_counts_tokens_and_active_requests() -> None:
     assert snapshot.terminal_requests == 0
 
 
+def test_iteration_activity_is_aggregated() -> None:
+    collector = RequestMetricsCollector()
+
+    collector.record_iteration(
+        prefill_requests=2,
+        decode_requests=1,
+    )
+    collector.record_iteration(
+        prefill_requests=0,
+        decode_requests=4,
+    )
+
+    snapshot = collector.snapshot()
+
+    assert snapshot.iterations == 2
+    assert snapshot.prefill_requests == 2
+    assert snapshot.decode_requests == 5
+    assert snapshot.last_batch_size == 4
+    assert snapshot.maximum_batch_size == 4
+
+
+def test_negative_iteration_counts_are_rejected() -> None:
+    collector = RequestMetricsCollector()
+
+    with pytest.raises(
+        ValueError,
+        match="must be nonnegative",
+    ):
+        collector.record_iteration(
+            prefill_requests=-1,
+            decode_requests=0,
+        )
+
+
 def test_clock_moving_backwards_is_rejected() -> None:
-    collector = RequestMetricsCollector(clock=FakeClock([5.0, 4.0]))
+    collector = RequestMetricsCollector(
+        clock=FakeClock(
+            [
+                5.0,
+                4.0,
+            ]
+        )
+    )
 
     collector.request_received("A")
 
@@ -210,7 +289,7 @@ def test_clock_moving_backwards_is_rejected() -> None:
         collector.request_admitted("A")
 
 
-def test_invalid_manual_timestamp_order_is_rejected() -> None:
+def test_invalid_timestamp_order_is_rejected() -> None:
     with pytest.raises(
         ValueError,
         match="request_finished cannot precede",
@@ -229,7 +308,10 @@ def test_invalid_manual_timestamp_order_is_rejected() -> None:
 
 @pytest.mark.parametrize(
     "history_size",
-    [0, -1],
+    [
+        0,
+        -1,
+    ],
 )
 def test_history_size_must_be_positive(
     history_size: int,

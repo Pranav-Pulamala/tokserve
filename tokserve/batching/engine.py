@@ -2,11 +2,17 @@
 
 from dataclasses import dataclass
 
-from tokserve.batching.execution import execute_decode, execute_prefill
+from tokserve.batching.execution import (
+    execute_decode,
+    execute_prefill,
+)
 from tokserve.batching.plan import build_iteration_plan
 from tokserve.engine.model import LlamaModel
 from tokserve.engine.paged.manager import PagedKVCacheManager
 from tokserve.generation.types import GenerationResult
+from tokserve.metrics.request_metrics import (
+    RequestMetricsCollector,
+)
 from tokserve.scheduler.scheduler import RequestScheduler
 
 
@@ -30,6 +36,8 @@ class ContinuousBatchEngine:
         model: LlamaModel,
         scheduler: RequestScheduler,
         cache_manager: PagedKVCacheManager,
+        *,
+        metrics: RequestMetricsCollector | None = None,
     ) -> None:
         if scheduler.cache_manager is not cache_manager:
             raise ValueError("scheduler and engine must share the cache manager")
@@ -37,6 +45,7 @@ class ContinuousBatchEngine:
         self.model = model
         self.scheduler = scheduler
         self.cache_manager = cache_manager
+        self.metrics = metrics
         self._iteration = 0
         self._history: list[IterationRecord] = []
         self._results: list[GenerationResult] = []
@@ -57,17 +66,24 @@ class ContinuousBatchEngine:
         """Run one admission and execution iteration."""
 
         schedule_result = self.scheduler.schedule()
+
+        if self.metrics is not None:
+            for request in schedule_result.admitted_requests:
+                self.metrics.request_admitted(request.request_id)
+
         plan = build_iteration_plan(self.scheduler.running_requests)
 
         execute_prefill(
             self.model,
             self.cache_manager,
             plan.prefill_requests,
+            metrics=self.metrics,
         )
         execute_decode(
             self.model,
             self.cache_manager,
             plan.decode_requests,
+            metrics=self.metrics,
         )
 
         completed_ids: list[str] = []
@@ -77,23 +93,40 @@ class ContinuousBatchEngine:
                 continue
 
             result = request.build_result()
-            self.scheduler.complete(request.request_id, result)
+            self.scheduler.complete(
+                request.request_id,
+                result,
+            )
+
+            if self.metrics is not None:
+                self.metrics.complete_request(
+                    request.request_id,
+                    result.stop_reason,
+                )
+
             self._results.append(result)
             completed_ids.append(request.request_id)
 
         record = IterationRecord(
             iteration=self._iteration,
             admitted_ids=tuple(
-                request.request_id for request in schedule_result.admitted_requests
+                request.request_id for request in (schedule_result.admitted_requests)
             ),
             prefill_ids=tuple(request.request_id for request in plan.prefill_requests),
             decode_ids=tuple(request.request_id for request in plan.decode_requests),
             completed_ids=tuple(completed_ids),
             active_ids=tuple(
-                request.request_id for request in self.scheduler.running_requests
+                request.request_id for request in (self.scheduler.running_requests)
             ),
         )
         self._history.append(record)
+
+        if self.metrics is not None:
+            self.metrics.record_iteration(
+                prefill_requests=len(plan.prefill_requests),
+                decode_requests=len(plan.decode_requests),
+            )
+
         self._iteration += 1
         return record
 
