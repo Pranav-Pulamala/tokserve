@@ -8,7 +8,10 @@ from typing import cast
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import StreamingResponse
 
-from tokserve.api.schemas import GenerateRequest, GenerateResponse
+from tokserve.api.schemas import (
+    GenerateRequest,
+    GenerateResponse,
+)
 from tokserve.api.service import (
     GenerationService,
     GenerationServiceError,
@@ -21,18 +24,21 @@ from tokserve.api.streaming import (
     FailureEvent,
     TokenEvent,
 )
+from tokserve.metrics.serving import (
+    ServingMetricsSnapshot,
+)
 
 
 def create_app(
     generation_service: GenerationService | None = None,
 ) -> FastAPI:
-    """Create a TokServe application with injectable inference state."""
+    """Create an application with injectable inference state."""
 
     @asynccontextmanager
     async def lifespan(
         _: FastAPI,
     ) -> AsyncIterator[None]:
-        """Release serving resources during application shutdown."""
+        """Release serving resources during shutdown."""
 
         yield
 
@@ -48,18 +54,16 @@ def create_app(
 
     @application.get("/health")
     async def health() -> dict[str, str]:
-        """Report that the HTTP application is available."""
+        """Report HTTP application availability."""
 
         return {"status": "ok"}
 
-    @application.post(
-        "/v1/generate",
-        response_model=None,
+    @application.get(
+        "/metrics",
+        response_model=ServingMetricsSnapshot,
     )
-    async def generate(
-        payload: GenerateRequest,
-    ) -> GenerateResponse | StreamingResponse:
-        """Generate a complete response or stream generation events."""
+    async def metrics() -> ServingMetricsSnapshot:
+        """Return current JSON serving metrics."""
 
         service = cast(
             GenerationService | None,
@@ -68,31 +72,56 @@ def create_app(
 
         if service is None:
             raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="generation service is unavailable",
+                status_code=(status.HTTP_503_SERVICE_UNAVAILABLE),
+                detail=("generation service is unavailable"),
+            )
+
+        return await service.serving_metrics_snapshot()
+
+    @application.post(
+        "/v1/generate",
+        response_model=None,
+    )
+    async def generate(
+        payload: GenerateRequest,
+    ) -> GenerateResponse | StreamingResponse:
+        """Generate a complete or streaming response."""
+
+        service = cast(
+            GenerationService | None,
+            application.state.generation_service,
+        )
+
+        if service is None:
+            raise HTTPException(
+                status_code=(status.HTTP_503_SERVICE_UNAVAILABLE),
+                detail=("generation service is unavailable"),
             )
 
         try:
             if payload.stream:
                 session = await service.start_stream(payload)
                 return StreamingResponse(
-                    stream_sse_events(service, session),
+                    stream_sse_events(
+                        service,
+                        session,
+                    ),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache",
-                        "X-Content-Type-Options": "nosniff",
+                        "X-Content-Type-Options": ("nosniff"),
                     },
                 )
 
             return await service.generate(payload)
         except RequestRejectedError as error:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=(status.HTTP_400_BAD_REQUEST),
                 detail=str(error),
             ) from error
         except GenerationServiceError as error:
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                status_code=(status.HTTP_500_INTERNAL_SERVER_ERROR),
                 detail="generation failed",
             ) from error
 
@@ -103,26 +132,24 @@ async def stream_sse_events(
     service: GenerationService,
     session: GenerationStreamSession,
 ) -> AsyncIterator[str]:
-    """Encode one request's generation events as SSE records."""
+    """Encode generation events as SSE records."""
 
     async for event in service.stream_events(session):
         if isinstance(event, TokenEvent):
             payload: dict[str, object] = {
                 "request_id": session.request_id,
                 "token_id": event.token_id,
-                "generated_text": service.tokenizer.decode(
-                    list(event.token_ids),
-                ),
+                "generated_text": (service.tokenizer.decode(list(event.token_ids))),
             }
         elif isinstance(event, DoneEvent):
             payload = {
                 "request_id": session.request_id,
-                "finish_reason": event.finish_reason,
+                "finish_reason": (event.finish_reason),
             }
         elif isinstance(event, CancelledEvent):
             payload = {
                 "request_id": session.request_id,
-                "message": "generation cancelled",
+                "message": ("generation cancelled"),
             }
         elif isinstance(event, FailureEvent):
             payload = {
@@ -137,7 +164,7 @@ async def stream_sse_events(
             separators=(",", ":"),
             ensure_ascii=False,
         )
-        yield f"event: {event.kind}\ndata: {encoded}\n\n"
+        yield (f"event: {event.kind}\ndata: {encoded}\n\n")
 
 
 app = create_app()

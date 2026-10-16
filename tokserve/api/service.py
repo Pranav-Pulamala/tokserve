@@ -29,6 +29,10 @@ from tokserve.batching.engine import ContinuousBatchEngine
 from tokserve.metrics.request_metrics import (
     RequestMetricsCollector,
 )
+from tokserve.metrics.serving import (
+    ServingMetricsSnapshot,
+    capture_serving_metrics,
+)
 from tokserve.scheduler.request import (
     RequestState,
     ScheduledRequest,
@@ -96,15 +100,27 @@ class GenerationService:
     def active_stream_request_ids(
         self,
     ) -> tuple[str, ...]:
-        """Return request IDs with registered event streams."""
+        """Return registered streaming request IDs."""
 
         return self._event_broker.active_request_ids
+
+    async def serving_metrics_snapshot(
+        self,
+    ) -> ServingMetricsSnapshot:
+        """Capture a consistent live serving snapshot."""
+
+        async with self._iteration_lock:
+            return capture_serving_metrics(
+                self.metrics,
+                self.engine.scheduler,
+                self.engine.cache_manager.allocator,
+            )
 
     async def generate(
         self,
         payload: GenerateRequest,
     ) -> GenerateResponse:
-        """Submit and complete one non-streaming generation request."""
+        """Submit and complete a non-streaming request."""
 
         request = await self._submit(payload)
 
@@ -144,12 +160,10 @@ class GenerationService:
         self,
         payload: GenerateRequest,
     ) -> GenerationStreamSession:
-        """Submit one request and register its event stream."""
+        """Submit a request and register its event stream."""
 
         request = await self._submit(payload)
-        event_stream = self._event_broker.open_stream(
-            request.request_id,
-        )
+        event_stream = self._event_broker.open_stream(request.request_id)
         return GenerationStreamSession(
             request=request,
             event_stream=event_stream,
@@ -192,12 +206,10 @@ class GenerationService:
             await self._cancel_if_active(request)
 
             if request.request_id in self._event_broker.active_request_ids:
-                self._event_broker.discard_stream(
-                    request.request_id,
-                )
+                self._event_broker.discard_stream(request.request_id)
 
     async def _advance_engine(self) -> None:
-        """Run one engine iteration and publish stream progress."""
+        """Run one engine iteration and publish progress."""
 
         async with self._iteration_lock:
             await asyncio.to_thread(self.engine.step)
@@ -221,7 +233,7 @@ class GenerationService:
                     )
 
     async def shutdown(self) -> None:
-        """Cancel active work and discard registered streams."""
+        """Cancel active work and discard streams."""
 
         async with self._iteration_lock:
             active_requests = (
@@ -305,7 +317,7 @@ class GenerationService:
         self,
         request: ScheduledRequest,
     ) -> None:
-        """Release an active failed request and record failure."""
+        """Release and record an active failed request."""
 
         async with self._iteration_lock:
             if request.state in (
