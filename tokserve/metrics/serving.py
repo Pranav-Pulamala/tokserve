@@ -5,6 +5,10 @@ from dataclasses import dataclass
 from tokserve.engine.paged.allocator import (
     PhysicalBlockAllocator,
 )
+from tokserve.metrics.aggregation import (
+    ObservationMetrics,
+    aggregate_request_metrics,
+)
 from tokserve.metrics.request_metrics import (
     RequestMetricsCollector,
 )
@@ -41,7 +45,7 @@ class CacheMetrics:
 
 @dataclass(frozen=True)
 class RequestCountMetrics:
-    """Cumulative request outcomes and live queue state."""
+    """Cumulative outcomes and live request state."""
 
     received_total: int
     admitted_total: int
@@ -55,19 +59,18 @@ class RequestCountMetrics:
     def __post_init__(self) -> None:
         """Reject negative request counts."""
 
-        if any(
-            value < 0
-            for value in (
-                self.received_total,
-                self.admitted_total,
-                self.completed_total,
-                self.failed_total,
-                self.cancelled_total,
-                self.active_metrics_records,
-                self.waiting_current,
-                self.running_current,
-            )
-        ):
+        values = (
+            self.received_total,
+            self.admitted_total,
+            self.completed_total,
+            self.failed_total,
+            self.cancelled_total,
+            self.active_metrics_records,
+            self.waiting_current,
+            self.running_current,
+        )
+
+        if any(value < 0 for value in values):
             raise ValueError("request counts must be nonnegative")
 
 
@@ -86,7 +89,7 @@ class TokenMetrics:
 
 @dataclass(frozen=True)
 class BatchingMetrics:
-    """Continuous-batching iteration observations."""
+    """Continuous-batching observations."""
 
     iterations_total: int
     prefill_requests_total: int
@@ -95,18 +98,17 @@ class BatchingMetrics:
     maximum_batch_size: int
 
     def __post_init__(self) -> None:
-        """Reject negative batching observations."""
+        """Reject negative batching values."""
 
-        if any(
-            value < 0
-            for value in (
-                self.iterations_total,
-                self.prefill_requests_total,
-                self.decode_requests_total,
-                self.last_batch_size,
-                self.maximum_batch_size,
-            )
-        ):
+        values = (
+            self.iterations_total,
+            self.prefill_requests_total,
+            self.decode_requests_total,
+            self.last_batch_size,
+            self.maximum_batch_size,
+        )
+
+        if any(value < 0 for value in values):
             raise ValueError("batching values must be nonnegative")
 
         if self.last_batch_size > self.maximum_batch_size:
@@ -119,13 +121,16 @@ class ServingMetricsSnapshot:
 
     schema_version: int
     duration_unit: str
+    percentile_method: str
+    percentile_population: str
     requests: RequestCountMetrics
     tokens: TokenMetrics
     batching: BatchingMetrics
     kv_cache: CacheMetrics
+    observations: ObservationMetrics
 
     def __post_init__(self) -> None:
-        """Validate stable public metadata."""
+        """Validate public metadata."""
 
         if self.schema_version != 1:
             raise ValueError("unsupported metrics schema version")
@@ -133,13 +138,19 @@ class ServingMetricsSnapshot:
         if self.duration_unit != "seconds":
             raise ValueError("duration_unit must be seconds")
 
+        if self.percentile_method != "linear_interpolation":
+            raise ValueError("unsupported percentile method")
+
+        if self.percentile_population != "bounded_terminal_request_history":
+            raise ValueError("unsupported percentile population")
+
 
 def capture_serving_metrics(
     collector: RequestMetricsCollector,
     scheduler: RequestScheduler,
     allocator: PhysicalBlockAllocator,
 ) -> ServingMetricsSnapshot:
-    """Capture current metrics without performing inference."""
+    """Capture current metrics without inference."""
 
     aggregate = collector.snapshot()
     capacity = allocator.num_blocks
@@ -149,6 +160,8 @@ def capture_serving_metrics(
     return ServingMetricsSnapshot(
         schema_version=1,
         duration_unit="seconds",
+        percentile_method=("linear_interpolation"),
+        percentile_population=("bounded_terminal_request_history"),
         requests=RequestCountMetrics(
             received_total=(aggregate.requests_received),
             admitted_total=(aggregate.requests_admitted),
@@ -175,4 +188,5 @@ def capture_serving_metrics(
             free_blocks=free,
             utilization_ratio=allocated / capacity,
         ),
+        observations=aggregate_request_metrics(aggregate.completed_records),
     )
