@@ -23,6 +23,13 @@ from tokserve.benchmarking.manifest import (
     create_manifest,
     write_manifest,
 )
+from tokserve.benchmarking.optimized import (
+    OptimizedMeasurement,
+    ParityEvidence,
+    benchmark_optimized,
+    expected_triton_path,
+    validate_optimized_config,
+)
 from tokserve.benchmarking.timing import (
     TimingResult,
     measure_operations,
@@ -38,12 +45,17 @@ __all__ = [
     "InferenceMeasurement",
     "InputKind",
     "ModelSpec",
+    "OptimizedMeasurement",
+    "ParityEvidence",
     "PromptSpec",
     "TimingResult",
     "WorkloadKind",
     "benchmark_baseline",
+    "benchmark_optimized",
     "capture_environment",
     "create_manifest",
+    "expected_triton_path",
     "measure_operations",
+    "validate_optimized_config",
     "write_manifest",
 ]
